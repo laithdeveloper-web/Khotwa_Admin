@@ -332,7 +332,7 @@ tbody tr.clickable:hover{background:var(--sand)}
    هذا هو نفس CFG.url المستخدم في khotwa_orders.html حرفيًا.
    لا تضف رابط نشر ثانٍ هنا، لأن ذلك قد يخلط بين ملفي بيانات مختلفين.
    ============================================================ */
-const API_URL = 'https://script.google.com/macros/s/AKfycbyAHZe1Cszsutg0zxZB_muKS6a1r2t3jwoUVPay1kTJyC7F3PRV-tbu-Ymih_-vXzh7/exec';
+const API_URL = 'https://script.google.com/macros/s/AKfycbyJu4yITJYSV6h-dNPjfPcMVOn_oEwckLlXnrmCp5W-_Amx9CzPABjC7MUUgszNKz1N2g/exec';
 const ADMIN_PASSWORD = 'khotwa2024';
 const BRAND = { name: 'خطوة', tag: 'نبني علامتك التجارية من الفكرة إلى السوق' };
 
@@ -516,17 +516,54 @@ function deriveCategories() {
   return [...seen.values()];
 }
 
+/* يحوّل أي شكل استجابة إلى {orders:[...], items:[...]} — بنفس روح pickArray المستخدمة
+   للمنتجات/الأقسام، حتى لا تفشل الطلبات بصمت لمجرد اختلاف شكل الرد. */
+function extractOrdersBundle(res) {
+  if (!res) return null;
+  if (Array.isArray(res)) return { orders: res, items: [] };
+  if (typeof res !== 'object') return null;
+  if (res.success === false) return null;
+  // الشكل المعتاد: {data:{orders,items,...}}
+  if (res.data && typeof res.data === 'object' && !Array.isArray(res.data)) {
+    if (Array.isArray(res.data.orders)) {
+      return { orders: res.data.orders, items: Array.isArray(res.data.items) ? res.data.items : [] };
+    }
+  }
+  // خادم يعيد data كمصفوفة طلبات مباشرة (مثل getOrders)
+  if (Array.isArray(res.data)) return { orders: res.data, items: Array.isArray(res.items) ? res.items : [] };
+  // مفاتيح على المستوى الأعلى مباشرة
+  if (Array.isArray(res.orders)) return { orders: res.orders, items: Array.isArray(res.items) ? res.items : [] };
+  return null;
+}
+
 async function loadOrders() {
-  // نفس الطلب المستخدم حرفيًا في khotwa_orders.html؛ لا قراءة من سيرفر إدارة منفصل.
-  const res = await apiGet({ sheet: 'Orders', action: 'ordersBundle' });
-  const bundle = (res && res.data && typeof res.data === 'object' && !Array.isArray(res.data))
-    ? res.data
-    : res;
+  /* المصدر نفسه المستخدم في khotwa_orders.html، لكن مع مسارين احتياطيين حتى لا تظهر
+     "0 طلب" بصمت لمجرد أن شكل رد الخادم اختلف قليلاً عمّا هو متوقع.
+     1) ordersBundle (الأسرع: طلب واحد لكل شيء)
+     2) getOrders/sheet=Orders (احتياطي مباشر لو ordersBundle غير مدعوم أو أعاد قائمة فارغة) */
+  let bundle = null;
+  let firstErr = null;
+  try {
+    const res = await apiGet({ sheet: 'Orders', action: 'ordersBundle' });
+    bundle = extractOrdersBundle(res);
+  } catch (e) { firstErr = e; }
+
+  if (!bundle || !Array.isArray(bundle.orders) || !bundle.orders.length) {
+    for (const params of [{ action: 'getOrders', sheet: 'Orders' }, { sheet: 'Orders' }]) {
+      try {
+        const res2 = await apiGet(params);
+        const alt = extractOrdersBundle(res2);
+        if (alt && Array.isArray(alt.orders) && alt.orders.length) { bundle = alt; firstErr = null; break; }
+        if (alt && !bundle) bundle = alt; // نحتفظ بردّ فارغ صالح البنية كخيار أخير
+      } catch (e) { firstErr = firstErr || e; }
+    }
+  }
+
   if (!bundle || !Array.isArray(bundle.orders)) {
-    throw new Error('استجابة ordersBundle لا تحتوي على قائمة orders');
+    throw firstErr || new Error('استجابة الطلبات لا تحتوي على قائمة orders');
   }
   const items = Array.isArray(bundle.items) ? bundle.items : [];
-  orders = (Array.isArray(bundle.orders) ? bundle.orders : []).map(o => normalizeOrder(o, items));
+  orders = bundle.orders.map(o => normalizeOrder(o, items));
   renderOrders();
 }
 

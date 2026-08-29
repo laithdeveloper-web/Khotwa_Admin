@@ -328,15 +328,11 @@ tbody tr.clickable:hover{background:var(--sand)}
 
 <script>
 /* ============================================================
-/* ============================================================
-   إعدادات الاتصال — روابط نشر Google Apps Script
-   تُجرَّب بالترتيب ويُثبَّت أول رابط يستجيب بنجاح.
+   إعداد الاتصال — مصدر موحّد لكل البيانات.
+   هذا هو نفس CFG.url المستخدم في khotwa_orders.html حرفيًا.
+   لا تضف رابط نشر ثانٍ هنا، لأن ذلك قد يخلط بين ملفي بيانات مختلفين.
    ============================================================ */
-const API_URLS = [
-  'https://script.google.com/macros/s/AKfycby39mP9nrpajj_Nbdn1z26lFU-LovFp6_OLlIF9nOAWwMmO9QC_nBHWoSFo3FJjG9ACZA/exec',
-  'https://script.google.com/macros/s/AKfycby39mP9nrpajj_Nbdn1z26lFU-LovFp6_OLlIF9nOAWwMmO9QC_nBHWoSFo3FJjG9ACZA/exec'
-].filter(u => u && u.indexOf('PUT_YOUR') !== 0);
-let API_URL = API_URLS[0] || '';
+const API_URL = 'https://script.google.com/macros/s/AKfycbyAHZe1Cszsutg0zxZB_muKS6a1r2t3jwoUVPay1kTJyC7F3PRV-tbu-Ymih_-vXzh7/exec';
 const ADMIN_PASSWORD = 'khotwa2024';
 const BRAND = { name: 'خطوة', tag: 'نبني علامتك التجارية من الفكرة إلى السوق' };
 
@@ -364,7 +360,7 @@ async function withBusy(text, fn, btn) {
 }
 
 /* ===== الاتصال بالسيرفر =====
-   - GET: يجرّب كل رابط في API_URLS ويثبت على أول رابط ناجح.
+   - GET وPOST يستخدمان رابط الطلبات نفسه فقط.
    - يقرأ النص أولًا ثم يحوّله JSON حتى نلتقط أخطاء Apps Script (صفحة HTML).
    - يمنع الكاش بإضافة طابع زمني.
    - POST بنوع text/plain لتفادي طلب preflight الذي يرفضه Apps Script. */
@@ -382,43 +378,32 @@ async function readJson(res) {
   catch (e) { throw new Error('رد غير صالح من الخادم (تحقق من صلاحية النشر: Anyone)'); }
 }
 async function apiGet(params) {
-  if (!API_URLS.length) throw new Error('API_URL غير مضبوط');
-  const order = [API_URL, ...API_URLS.filter(u => u !== API_URL)];
+  if (!API_URL) throw new Error('API_URL غير مضبوط');
   let lastErr;
-  for (const base of order) {
-    for (let attempt = 0; attempt < 2; attempt++) {
-      try {
-        const res = await fetch(buildUrl(base, params), { cache: 'no-store', redirect: 'follow' });
-        const json = await readJson(res);
-        if (json && json.success === false) throw new Error(json.error || 'خطأ من الخادم');
-        API_URL = base;
-        return json;
-      } catch (e) {
-        lastErr = e;
-        if (attempt === 0) await new Promise(r => setTimeout(r, 350));
-      }
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      const res = await fetch(buildUrl(API_URL, params), { cache: 'no-store', redirect: 'follow' });
+      const json = await readJson(res);
+      if (json && json.success === false) throw new Error(json.error || 'خطأ من الخادم');
+      return json;
+    } catch (e) {
+      lastErr = e;
+      if (attempt === 0) await new Promise(r => setTimeout(r, 400));
     }
   }
   throw lastErr || new Error('تعذر الاتصال');
 }
 async function apiPost(action, payload, extra) {
-  if (!API_URLS.length) throw new Error('API_URL غير مضبوط');
+  if (!API_URL) throw new Error('API_URL غير مضبوط');
   const body = JSON.stringify(Object.assign({ sheet: 'Orders', action: action, payload: payload || {} }, extra || {}));
-  const order = [API_URL, ...API_URLS.filter(u => u !== API_URL)];
-  let lastErr;
-  for (const base of order) {
-    try {
-      const res = await fetch(base, {
-        method: 'POST',
-        headers: { 'Content-Type': 'text/plain;charset=utf-8' },
-        body: body
-      });
-      const json = await readJson(res);
-      API_URL = base;
-      return json;
-    } catch (e) { lastErr = e; }
-  }
-  throw lastErr || new Error('تعذر الاتصال');
+  const res = await fetch(API_URL, {
+    method: 'POST',
+    headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+    body: body
+  });
+  const json = await readJson(res);
+  if (json && json.success === false) throw new Error(json.error || 'خطأ من الخادم');
+  return json;
 }
 /* واجهة موحّدة متوافقة مع بقية الكود */
 async function apiCall(action, payload, method) {
@@ -532,20 +517,13 @@ function deriveCategories() {
 }
 
 async function loadOrders() {
-  let bundle = null;
-  for (const params of [{ action: 'ordersBundle', sheet: 'Orders' }, { action: 'ordersBundle' }]) {
-    try {
-      const res = await apiGet(params);
-      const d = (res && res.data && typeof res.data === 'object' && !Array.isArray(res.data)) ? res.data : res;
-      if (d && (Array.isArray(d.orders) || Array.isArray(d.items))) { bundle = d; break; }
-    } catch (e) { /* نجرّب الصيغة التالية */ }
-  }
-  if (!bundle) {
-    const [ords, its] = await Promise.all([
-      fetchList([{ action: 'getOrders' }, { sheet: 'Orders' }, { action: 'list' }], ['data', 'orders']),
-      fetchList([{ sheet: 'OrderItems' }, { action: 'getOrderItems' }], ['data', 'items']).catch(() => [])
-    ]);
-    bundle = { orders: ords, items: its };
+  // نفس الطلب المستخدم حرفيًا في khotwa_orders.html؛ لا قراءة من سيرفر إدارة منفصل.
+  const res = await apiGet({ sheet: 'Orders', action: 'ordersBundle' });
+  const bundle = (res && res.data && typeof res.data === 'object' && !Array.isArray(res.data))
+    ? res.data
+    : res;
+  if (!bundle || !Array.isArray(bundle.orders)) {
+    throw new Error('استجابة ordersBundle لا تحتوي على قائمة orders');
   }
   const items = Array.isArray(bundle.items) ? bundle.items : [];
   orders = (Array.isArray(bundle.orders) ? bundle.orders : []).map(o => normalizeOrder(o, items));

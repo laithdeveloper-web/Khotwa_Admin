@@ -25,7 +25,8 @@
   --ok:oklch(0.55 0.13 155); --warn:oklch(0.72 0.13 75); --danger:oklch(0.55 0.18 25);
 }
 *{box-sizing:border-box}
-body{margin:0;background:var(--bg);color:var(--fg);font-family:"Cairo","Manrope",sans-serif;-webkit-font-smoothing:antialiased}
+html{overflow-x:hidden}
+body{margin:0;overflow-x:hidden;background:var(--bg);color:var(--fg);font-family:"Cairo","Manrope",sans-serif;-webkit-font-smoothing:antialiased}
 h1,h2,h3{font-family:"Cormorant Garamond","Cairo",serif;font-weight:600;letter-spacing:-.015em;margin:0}
 a{color:inherit;text-decoration:none}
 img{display:block;max-width:100%}
@@ -140,10 +141,55 @@ tbody tr.clickable:hover{background:var(--sand)}
 @keyframes fade{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:none}}
 
 @media (max-width:900px){
-  .app{grid-template-columns:1fr}
+  .app{grid-template-columns:minmax(0,1fr);grid-template-rows:auto 1fr}
+  main{min-width:0}
   aside{position:static;height:auto;flex-direction:row;flex-wrap:wrap;align-items:center;gap:.8rem}
   aside .foot{display:none}
   nav{flex-direction:row;flex-wrap:wrap;flex:1;justify-content:flex-end}
+}
+
+/* ===== الجوال ===== */
+@media (max-width:600px){
+  :root{--pad:.85rem}
+  aside{padding:1rem .8rem;gap:.7rem}
+  .brand .mark{height:56px;width:56px;box-shadow:0 0 8px #3b82f6,0 0 18px #2563eb,0 0 30px rgba(37,99,235,.3)}
+  .brand .n{font-size:1.25rem}
+  .brand small{font-size:.58rem;letter-spacing:.14em}
+  aside{flex-direction:column;align-items:stretch}
+  .brand{justify-content:center}
+  nav{flex:0 0 auto;width:100%;flex-wrap:nowrap;overflow-x:auto;justify-content:flex-start;gap:.35rem;padding-bottom:.2rem;scrollbar-width:none}
+  nav::-webkit-scrollbar{display:none}
+  nav button{flex:0 0 auto;white-space:nowrap;padding:.5rem .8rem;font-size:.82rem;gap:.4rem;border-radius:999px;background:oklch(1 0 0/.08)}
+  main{padding:var(--pad) var(--pad) 4rem}
+  .topbar{gap:.6rem;margin-bottom:1rem}
+  .topbar h1{font-size:1.4rem}
+  .topbar{flex-direction:column;align-items:stretch}
+  .topbar>div{display:flex;gap:.5rem;flex-wrap:wrap}
+  .topbar .btn{flex:1;justify-content:center;white-space:nowrap}
+  .stats{grid-template-columns:repeat(2,1fr);gap:.6rem}
+  .stat{padding:.7rem .8rem}
+  .stat b{font-size:1.2rem}
+  .toolbar{gap:.5rem}
+  .toolbar .btn,.toolbar select{flex:1;justify-content:center}
+  .search{min-width:0;flex:1 1 100%}
+  table{min-width:560px;font-size:.8rem}
+  thead th,tbody td{padding:.55rem .65rem}
+  .form-grid{grid-template-columns:1fr;gap:.7rem}
+  .form-card{padding:1rem}
+  .form-actions{flex-wrap:wrap}
+  .form-actions .btn{flex:1;justify-content:center}
+  .btn{font-size:.82rem;padding:.6rem .95rem}
+  .panel{width:100%}
+  .panel header{padding:.9rem 1rem}
+  .panel .actions .btn{flex:1;justify-content:center}
+  .login .box{padding:1.5rem 1.1rem}
+  .login .box h2{font-size:1.5rem}
+  .toast{inset-inline-start:1rem;inset-inline-end:1rem;transform:translateY(140%);text-align:center;font-size:.82rem}
+  .toast.on{transform:none}
+  .inv-meta,.inv-cust-grid,.rep-cards{grid-template-columns:repeat(2,1fr)}
+  .inv-page{padding:8mm 6mm}
+  .inv-doc-title{margin-inline-start:0;text-align:start;margin-top:8px}
+  .inv-head{flex-wrap:wrap}
 }
 
 /* ===== الطباعة ===== */

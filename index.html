@@ -431,96 +431,156 @@ async function withBusy(text, fn, btn) {
   try { return await fn(); } finally { busy(false); if (btn) btn.disabled = false; }
 }
 
-/* ===== الاتصال بالسيرفر — نسخة سريعة =====
-   الفكرة الذكية لحل البطء (ثلاث طبقات):
-   1) كاش محلي (localStorage): اللوحة تُرسم فورًا من آخر نسخة محفوظة (0ms)
-      ثم تُحدَّث بالخلفية — Stale While Revalidate.
-   2) نبض إصدار خفيف: نطلب action=version (بضع بايتات) بدل تنزيل كل البيانات،
-      ولا ننزّل الحزمة إلا إذا تغيّر رقم إصدار البيانات على الخادم.
-   3) نداء واحد موحّد (ordersBundle) يجلب الطلبات + المنتجات + الأقسام معًا،
-      بدل 3 نداءات متسلسلة مع سلاسل بدائل بطيئة.
-   ملاحظات: GET بدون preflight، وPOST بنوع text/plain كما كان. */
-const LS_KEY   = 'khotwa_admin_cache_v4';   // v4: إبطال أي كاش قديم فارغ (0 طلب)
-const PING_MS  = 30000;   // نبض الإصدار (أخف على الخادم)
-const VARIANT_KEY = 'khotwa_admin_variant_v1'; // نتذكّر شكل الطلب الناجح لكل خادم
-let DATA_VERSION = '';
-let inflightBundle = null;
-let VERSION_SUPPORTED = true;   // يُطفأ تلقائيًا إذا لم يدعم الخادم action=version
-let lastBundleAt = 0;           // منع النداءات المكرّرة المتلاحقة
+ /* ===== الاتصال بالسيرفر — طبقة اتصال متينة =====
+    هذه الطبقة تعالج أسباب البطء والفشل المتقطع في Google Apps Script:
+    - تعرض آخر نسخة محفوظة فورًا، ثم تحدّثها في الخلفية.
+    - تمنع الطلبات المتوازية المكررة لنفس الحزمة.
+    - تبدأ بطلب ordersBundle المعروف بدل تجربة خمسة مسارات في كل تحديث.
+    - تعيد المحاولة فقط لأخطاء الشبكة/المهلة/الخادم المؤقتة، وليس لأخطاء
+      الصلاحيات أو أخطاء البيانات.
+    - تلغي الطلبات الاحتياطية فور وصول رد صالح يحوي طلبات.
+    ملاحظة مهمة: لا يمكن للمتصفح ضمان اتصال دائم إذا كان نشر Apps Script
+    نفسه متوقفًا أو صلاحياته غير صحيحة، لكن اللوحة الآن لا تتجمد ولا تفقد
+    البيانات المحلية عند أي انقطاع مؤقت. */
+ const LS_KEY   = 'khotwa_admin_cache_v5';
+ const PING_MS  = 45000;
+ const VARIANT_KEY = 'khotwa_admin_variant_v2';
+ const REQUEST_TIMEOUT_MS = 15000;
+ const DISCOVERY_TIMEOUT_MS = 7000;
+ const RETRY_DELAYS_MS = [0, 650, 1400];
+ let DATA_VERSION = '';
+ let inflightBundle = null;
+ let VERSION_SUPPORTED = true;
+ let lastBundleAt = 0;
 
-/* ذاكرة أشكال الطلبات الناجحة: تمنع تجربة 5 بدائل بطيئة في كل مرة */
-function loadVariants() {
-  try { return JSON.parse(localStorage.getItem(VARIANT_KEY) || '{}') || {}; } catch (e) { return {}; }
-}
-function rememberVariant(url, params) {
-  try { const m = loadVariants(); m[url] = params; localStorage.setItem(VARIANT_KEY, JSON.stringify(m)); } catch (e) {}
-}
-function forgetVariant(url) {
-  try { const m = loadVariants(); delete m[url]; localStorage.setItem(VARIANT_KEY, JSON.stringify(m)); } catch (e) {}
-}
+ function sleep(ms) { return new Promise(resolve => setTimeout(resolve, ms)); }
 
-function buildUrl(base, params) {
-  const u = new URL(base);
-  Object.entries(params || {}).forEach(([k, v]) => {
-    if (v !== undefined && v !== null && v !== '') u.searchParams.set(k, v);
-  });
-  u.searchParams.set('_', Date.now());
-  return u.toString();
-}
-async function readJson(res) {
-  const text = await res.text();
-  try { return JSON.parse(text); }
-  catch (e) { throw new Error('رد غير صالح من الخادم (تحقق من صلاحية النشر: Anyone)'); }
-}
-/* GET سريع: محاولة واحدة بمهلة قصيرة، وإعادة محاولة فقط عند انقطاع الشبكة.
-   لا مزيد من الانتظار 20 ثانية × محاولتين × 5 بدائل × خادمين. */
-async function apiGet(params, timeoutMs, url, signal) {
-  const endpoint = url || API_URL;
-  if (!endpoint) throw new Error('API_URL غير مضبوط');
-  const once = async (ms) => {
-    const ctrl = new AbortController();
-    const onAbort = () => ctrl.abort();
-    if (signal) { if (signal.aborted) ctrl.abort(); else signal.addEventListener('abort', onAbort); }
-    const t = setTimeout(() => ctrl.abort(), ms);
-    try {
-      const res = await fetch(buildUrl(endpoint, params), { cache: 'no-store', redirect: 'follow', signal: ctrl.signal });
-      const json = await readJson(res);
-      if (json && json.success === false) throw new Error(json.error || 'خطأ من الخادم');
-      return json;
-    } finally {
-      clearTimeout(t);
-      if (signal) signal.removeEventListener('abort', onAbort);
-    }
-  };
-  const ms = timeoutMs || 9000;
-  try { return await once(ms); }
-  catch (e) {
-    if (signal && signal.aborted) throw e;
-    if (e && e.name === 'AbortError') throw new Error('انتهت مهلة الاتصال');
-    return await once(ms);   // إعادة واحدة فقط لأخطاء الشبكة العابرة
-  }
-}
-async function apiPost(action, payload, extra, url) {
-  const endpoint = url || API_URL;
-  if (!endpoint) throw new Error('API_URL غير مضبوط');
-  const body = JSON.stringify(Object.assign({ sheet: 'Orders', action: action, payload: payload || {} }, extra || {}));
-  const res = await fetch(endpoint, {
-    method: 'POST',
-    headers: { 'Content-Type': 'text/plain;charset=utf-8' },
-    body: body
-  });
-  const json = await readJson(res);
-  if (json && json.success === false) throw new Error(json.error || 'خطأ من الخادم');
-  return json;
-}
-/* واجهة موحّدة متوافقة مع بقية الكود */
-async function apiCall(action, payload, method, url) {
-  const res = (method && method.toUpperCase() === 'POST')
-    ? await apiPost(action, payload, payload && payload.id ? { id: payload.id } : null, url)
-    : await apiGet(Object.assign({ action: action }, payload || {}), undefined, url);
-  if (res && res.success === undefined) res.success = !(res && res.error);
-  return res;
-}
+ /* ذاكرة شكل الطلب الناجح لكل خادم، مع تنظيفها تلقائيًا عند تغيّر النشر. */
+ function loadVariants() {
+   try { return JSON.parse(localStorage.getItem(VARIANT_KEY) || '{}') || {}; } catch (e) { return {}; }
+ }
+ function rememberVariant(url, params) {
+   try { const m = loadVariants(); m[url] = params; localStorage.setItem(VARIANT_KEY, JSON.stringify(m)); } catch (e) {}
+ }
+ function forgetVariant(url) {
+   try { const m = loadVariants(); delete m[url]; localStorage.setItem(VARIANT_KEY, JSON.stringify(m)); } catch (e) {}
+ }
+
+ function buildUrl(base, params) {
+   const u = new URL(base);
+   Object.entries(params || {}).forEach(([k, v]) => {
+     if (v !== undefined && v !== null && v !== '') u.searchParams.set(k, v);
+   });
+   /* منع كاش المتصفح وCDN، مع الحفاظ على كل معاملات Apps Script. */
+   u.searchParams.set('_', Date.now());
+   return u.toString();
+ }
+
+ async function readJson(res) {
+   const text = await res.text();
+   let json = null;
+   try { json = JSON.parse(text); } catch (e) {}
+   if (!res.ok) {
+     const err = new Error((json && (json.error || json.message)) || `HTTP ${res.status}`);
+     err.status = res.status;
+     err.retryable = res.status === 408 || res.status === 425 || res.status === 429 || res.status >= 500;
+     throw err;
+   }
+   if (json === null) {
+     const err = new Error('رد غير صالح من الخادم (تحقق من صلاحية النشر: Anyone)');
+     err.retryable = true;
+     throw err;
+   }
+   return json;
+ }
+
+ /* fetch مع مهلة حقيقية وإلغاء نظيف؛ لا يبقى أي مؤقت أو listener بعد الرد. */
+ async function fetchWithTimeout(url, options, timeoutMs, externalSignal) {
+   const ctrl = new AbortController();
+   let timedOut = false;
+   let timer = null;
+   const onAbort = () => ctrl.abort();
+   if (externalSignal) {
+     if (externalSignal.aborted) ctrl.abort();
+     else externalSignal.addEventListener('abort', onAbort, { once: true });
+   }
+   timer = setTimeout(() => { timedOut = true; ctrl.abort(); }, timeoutMs);
+   try {
+     return await fetch(url, Object.assign({}, options || {}, { signal: ctrl.signal }));
+   } catch (e) {
+     if (timedOut) {
+       const err = new Error('انتهت مهلة الاتصال بالسيرفر');
+       err.retryable = true;
+       throw err;
+     }
+     throw e;
+   } finally {
+     clearTimeout(timer);
+     if (externalSignal) externalSignal.removeEventListener('abort', onAbort);
+   }
+ }
+
+ function networkError(e) {
+   if (!e) return true;
+   if (e.retryable !== undefined) return e.retryable;
+   return e.name === 'TypeError' || e.name === 'AbortError';
+ }
+
+ /* GET موثوق: ثلاث محاولات متدرجة فقط للأعطال العابرة. */
+ async function apiGet(params, timeoutMs, url, signal) {
+   const endpoint = url || API_URL;
+   if (!endpoint) throw new Error('API_URL غير مضبوط');
+   const ms = timeoutMs || REQUEST_TIMEOUT_MS;
+   let lastError = null;
+   for (let attempt = 0; attempt < RETRY_DELAYS_MS.length; attempt++) {
+     if (signal && signal.aborted) throw new DOMException('تم إلغاء الطلب', 'AbortError');
+     if (attempt) await sleep(RETRY_DELAYS_MS[attempt]);
+     try {
+       const res = await fetchWithTimeout(
+         buildUrl(endpoint, params),
+         { cache: 'no-store', redirect: 'follow', headers: { Accept: 'application/json,text/plain,*/*' } },
+         ms,
+         signal
+       );
+       const json = await readJson(res);
+       if (json && json.success === false) {
+         const err = new Error(json.error || 'خطأ من الخادم');
+         err.retryable = false;
+         throw err;
+       }
+       return json;
+     } catch (e) {
+       if (signal && signal.aborted) throw e;
+       lastError = e;
+       if (!networkError(e) || attempt === RETRY_DELAYS_MS.length - 1) throw e;
+     }
+   }
+   throw lastError || new Error('تعذر الاتصال بالسيرفر');
+ }
+
+ /* POST بمهلة واضحة. لا نعيد إرسال عمليات الكتابة تلقائيًا حتى لا يتكرر
+    الحفظ أو الحذف إذا كان الخادم نفّذ الطلب ثم انقطع الرد. */
+ async function apiPost(action, payload, extra, url) {
+   const endpoint = url || API_URL;
+   if (!endpoint) throw new Error('API_URL غير مضبوط');
+   const body = JSON.stringify(Object.assign({ sheet: 'Orders', action: action, payload: payload || {} }, extra || {}));
+   const res = await fetchWithTimeout(endpoint, {
+     method: 'POST',
+     headers: { 'Content-Type': 'text/plain;charset=utf-8', Accept: 'application/json,text/plain,*/*' },
+     body: body
+   }, REQUEST_TIMEOUT_MS);
+   const json = await readJson(res);
+   if (json && json.success === false) throw new Error(json.error || 'خطأ من الخادم');
+   return json;
+ }
+ /* واجهة موحّدة متوافقة مع بقية الكود */
+ async function apiCall(action, payload, method, url) {
+   const res = (method && method.toUpperCase() === 'POST')
+     ? await apiPost(action, payload, payload && payload.id ? { id: payload.id } : null, url)
+     : await apiGet(Object.assign({ action: action }, payload || {}), undefined, url);
+   if (res && res.success === undefined) res.success = !(res && res.error);
+   return res;
+ }
 
 
 /* ===== الكاش المحلي ===== */
@@ -639,87 +699,117 @@ function bundleOf(res) {
     categories: Array.isArray(src.categories) ? src.categories : (Array.isArray(res.categories) ? res.categories : null)
   };
 }
-/* جلب الحزمة من خادم واحد مع سلسلة بدائل (خوادم قديمة أو أسماء إجراءات مختلفة) */
-async function fetchBundleFrom(url) {
-  const DEFAULTS = [
-    { sheet: 'Orders', action: 'ordersBundle', slim: 1 },
-    { sheet: 'Orders', action: 'ordersBundle' },
-    { action: 'ordersBundle' },
-    { sheet: 'Orders', action: 'getOrders' },
-    { sheet: 'Orders' }
-  ];
-  const known = loadVariants()[url];
+ /* جلب الحزمة من خادم واحد:
+    نستخدم المسار المعروف أولًا. البدائل لا تبدأ إلا إذا فشل المسار
+    المعروف، بدل إطلاق خمسة طلبات ثقيلة في كل تحديث. */
+ async function fetchBundleFrom(url, externalSignal) {
+   const DEFAULTS = [
+     { sheet: 'Orders', action: 'ordersBundle', slim: 1 },
+     { sheet: 'Orders', action: 'ordersBundle' },
+     { action: 'ordersBundle' },
+     { sheet: 'Orders', action: 'getOrders' },
+     { sheet: 'Orders' }
+   ];
+   const known = loadVariants()[url];
+   const first = known || DEFAULTS[0];
+   let lastErr = null;
 
-  // 1) المسار السريع: الشكل الذي نجح آخر مرة — نداء واحد فقط
-  if (known) {
-    try {
-      const b = bundleOf(await apiGet(known, 12000, url));
-      if (b) { b.url = url; return b; }
-    } catch (e) { /* نسقط إلى الاكتشاف المتوازي */ }
-    forgetVariant(url);
-  }
+   try {
+     const b = bundleOf(await apiGet(first, REQUEST_TIMEOUT_MS, url, externalSignal));
+     if (b) { b.url = url; rememberVariant(url, first); return b; }
+     lastErr = new Error('استجابة غير متوقعة من الخادم');
+   } catch (e) {
+     if (externalSignal && externalSignal.aborted) throw e;
+     lastErr = e;
+     if (known) forgetVariant(url);
+   }
 
-  // 2) الاكتشاف: كل البدائل بالتوازي، ونأخذ أول رد صالح ونلغي الباقي
-  const ctrl = new AbortController();
-  let lastErr = null, best = null, pending = DEFAULTS.length;
-  return await new Promise((resolve, reject) => {
-    const done = (b, params) => {
-      if (params) rememberVariant(url, params);
-      ctrl.abort();
-      resolve(b);
-    };
-    DEFAULTS.forEach(params => {
-      apiGet(params, 12000, url, ctrl.signal)
-        .then(res => {
-          const b = bundleOf(res);
-          if (b) {
-            b.url = url;
-            if (b.orders && b.orders.length) return done(b, params);
-            if (!best) best = { b: b, params: params };
-          } else if (!lastErr) lastErr = new Error('استجابة غير متوقعة من الخادم');
-        })
-        .catch(e => { if (!lastErr) lastErr = e; })
-        .finally(() => {
-          if (--pending === 0) {
-            if (best) return done(best.b, best.params);
-            ctrl.abort();
-            reject(lastErr || new Error('تعذر جلب البيانات'));
-          }
-        });
-    });
-  });
-}
-/* الإصلاح الجذري: نقرأ من كل روابط النشر المعروفة بالتوازي ثم ندمج النتائج،
-   فلا تعود لوحة الإدارة تعرض 0 لمجرد أن الطلبات محفوظة على نشر آخر. */
-async function fetchBundle() {
-  if (inflightBundle) return inflightBundle;   // لا نداءين متوازيين لنفس البيانات
-  inflightBundle = (async () => {
-    const results = await Promise.allSettled(API_ENDPOINTS.map(u => fetchBundleFrom(u)));
-    const ok = results.filter(r => r.status === 'fulfilled').map(r => r.value);
-    if (!ok.length) {
-      const err = results.find(r => r.status === 'rejected');
-      throw (err && err.reason) || new Error('تعذر جلب البيانات');
-    }
-    const merged = { orders: [], items: [], products: [], categories: [] };
-    const seen = new Set();
-    ok.forEach(b => {
-      (b.items || []).forEach(i => merged.items.push(i));
-      (b.products || []).forEach(p => { if (!merged.products.some(x => String(x.id) === String(p.id))) merged.products.push(p); });
-      (b.categories || []).forEach(c => { if (!merged.categories.some(x => String(x.id || x.key || x.name) === String(c.id || c.key || c.name))) merged.categories.push(c); });
-      (b.orders || []).forEach(o => {
-        const key = String(o.order_number || o.orderNumber || o.number || o.id || o.order_id || JSON.stringify(o));
-        if (seen.has(key)) return;
-        seen.add(key);
-        const copy = Object.assign({}, o);
-        copy.__src = b.url;                 // نتذكّر مصدر الطلب لتحديث الحالة/الحذف لاحقًا
-        merged.orders.push(copy);
-      });
-    });
-    lastBundleAt = Date.now();
-    return merged;
-  })();
-  try { return await inflightBundle; } finally { inflightBundle = null; }
-}
+   /* اكتشاف متوافق مع الإصدارات القديمة، لكن بشكل تسلسلي ومهلة قصيرة. */
+   for (const params of DEFAULTS) {
+     if (JSON.stringify(params) === JSON.stringify(first)) continue;
+     try {
+       const b = bundleOf(await apiGet(params, DISCOVERY_TIMEOUT_MS, url, externalSignal));
+       if (b) { b.url = url; rememberVariant(url, params); return b; }
+       lastErr = new Error('استجابة غير متوقعة من الخادم');
+     } catch (e) {
+       if (externalSignal && externalSignal.aborted) throw e;
+       lastErr = e;
+     }
+   }
+   throw lastErr || new Error('تعذر جلب البيانات');
+ }
+
+ function mergeBundles(list) {
+   const merged = { orders: [], items: [], products: [], categories: [] };
+   const seenOrders = new Set(), seenProducts = new Set(), seenCategories = new Set();
+   (list || []).forEach(b => {
+     (b.items || []).forEach(i => merged.items.push(i));
+     (b.products || []).forEach(p => {
+       const key = String(p.id == null ? JSON.stringify(p) : p.id);
+       if (!seenProducts.has(key)) { seenProducts.add(key); merged.products.push(p); }
+     });
+     (b.categories || []).forEach(c => {
+       const key = String(c.id || c.key || c.name || JSON.stringify(c));
+       if (!seenCategories.has(key)) { seenCategories.add(key); merged.categories.push(c); }
+     });
+     (b.orders || []).forEach(o => {
+       const key = String(o.order_number || o.orderNumber || o.number || o.id || o.order_id || JSON.stringify(o));
+       if (seenOrders.has(key)) return;
+       seenOrders.add(key);
+       const copy = Object.assign({}, o);
+       copy.__src = b.url;
+       merged.orders.push(copy);
+     });
+   });
+   return merged;
+ }
+
+ /* نبدأ بالخادمين بالتوازي حتى لا يمنع عطل أحدهما ظهور الطلبات من الآخر.
+    إذا وصل رد يحوي طلبات، نعيده فورًا بدل انتظار endpoint بطيء، ثم ندمج
+    الرد المتأخر في الخلفية حتى لا نفقد المنتجات أو الأقسام الموجودة عليه.
+    أما إذا كانت كل الردود فارغة فننتظرها جميعًا للتأكد من أن النتيجة صفر فعلًا. */
+ async function fetchBundle() {
+   if (inflightBundle) return inflightBundle;
+   const runId = (fetchBundle._runId = (fetchBundle._runId || 0) + 1);
+   inflightBundle = (async () => {
+     const ctrl = new AbortController();
+     const tasks = API_ENDPOINTS.map(url => fetchBundleFrom(url, ctrl.signal)
+       .then(bundle => ({ ok: true, bundle }))
+       .catch(error => ({ ok: false, error })));
+
+     const fast = new Promise(resolve => {
+       tasks.forEach(task => task.then(result => {
+         if (result.ok && result.bundle.orders && result.bundle.orders.length) {
+           resolve({ fast: true, bundles: [result.bundle] });
+         }
+       }));
+     });
+     const all = Promise.all(tasks).then(results => {
+       const good = results.filter(r => r.ok).map(r => r.bundle);
+       if (!good.length) {
+         const error = results.find(r => !r.ok)?.error || new Error('تعذر جلب البيانات');
+         throw error;
+       }
+       return { fast: false, bundles: good };
+     });
+     const winner = await Promise.race([fast, all]);
+     if (winner.fast) {
+       /* لا نلغي endpoint الآخر: قد يحمل المنتجات/الأقسام. ندمجه لاحقًا
+          فقط إذا لم يبدأ تحميل أحدث أثناء انتظاره. */
+       all.then(result => {
+         const merged = mergeBundles(result.bundles);
+         const first = winner.bundles[0];
+         const hasMore = merged.orders.length > (first.orders || []).length ||
+           merged.products.length > (first.products || []).length ||
+           merged.categories.length > (first.categories || []).length;
+         if (hasMore && fetchBundle._runId === runId) applyBundle(merged);
+       }).catch(() => {});
+     }
+     lastBundleAt = Date.now();
+     return mergeBundles(winner.bundles);
+   })();
+   try { return await inflightBundle; } finally { inflightBundle = null; }
+ }
 function applyBundle(b) {
   if (b.products && b.products.length) products = b.products;
   if (b.categories && b.categories.length) categories = b.categories;

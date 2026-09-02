@@ -401,6 +401,12 @@ const sourceOf = o => (o && (ORDER_SOURCE.get(String(o.id)) || ORDER_SOURCE.get(
 
 const ADMIN_PASSWORD = 'khotwa2024';
 
+/* تسخين مسبق: نبدأ جلب البيانات فور فتح الصفحة (أثناء كتابة كلمة المرور)
+   حتى تكون جاهزة لحظة الدخول. */
+window.addEventListener('load', () => {
+  setTimeout(() => { try { fetchBundle().catch(() => {}); } catch (e) {} }, 0);
+});
+
 const BRAND = { name: 'خطوة', tag: 'نبني علامتك التجارية من الفكرة إلى السوق' };
 
 /* ===== أدوات ===== */
@@ -436,9 +442,23 @@ async function withBusy(text, fn, btn) {
       بدل 3 نداءات متسلسلة مع سلاسل بدائل بطيئة.
    ملاحظات: GET بدون preflight، وPOST بنوع text/plain كما كان. */
 const LS_KEY   = 'khotwa_admin_cache_v4';   // v4: إبطال أي كاش قديم فارغ (0 طلب)
-const PING_MS  = 12000;   // نبض الإصدار
+const PING_MS  = 30000;   // نبض الإصدار (أخف على الخادم)
+const VARIANT_KEY = 'khotwa_admin_variant_v1'; // نتذكّر شكل الطلب الناجح لكل خادم
 let DATA_VERSION = '';
 let inflightBundle = null;
+let VERSION_SUPPORTED = true;   // يُطفأ تلقائيًا إذا لم يدعم الخادم action=version
+let lastBundleAt = 0;           // منع النداءات المكرّرة المتلاحقة
+
+/* ذاكرة أشكال الطلبات الناجحة: تمنع تجربة 5 بدائل بطيئة في كل مرة */
+function loadVariants() {
+  try { return JSON.parse(localStorage.getItem(VARIANT_KEY) || '{}') || {}; } catch (e) { return {}; }
+}
+function rememberVariant(url, params) {
+  try { const m = loadVariants(); m[url] = params; localStorage.setItem(VARIANT_KEY, JSON.stringify(m)); } catch (e) {}
+}
+function forgetVariant(url) {
+  try { const m = loadVariants(); delete m[url]; localStorage.setItem(VARIANT_KEY, JSON.stringify(m)); } catch (e) {}
+}
 
 function buildUrl(base, params) {
   const u = new URL(base);
@@ -453,25 +473,33 @@ async function readJson(res) {
   try { return JSON.parse(text); }
   catch (e) { throw new Error('رد غير صالح من الخادم (تحقق من صلاحية النشر: Anyone)'); }
 }
-/* GET مع مهلة قصوى ومحاولة إعادة واحدة (لا يعلّق الواجهة) — يقبل تحديد الخادم */
-async function apiGet(params, timeoutMs, url) {
+/* GET سريع: محاولة واحدة بمهلة قصيرة، وإعادة محاولة فقط عند انقطاع الشبكة.
+   لا مزيد من الانتظار 20 ثانية × محاولتين × 5 بدائل × خادمين. */
+async function apiGet(params, timeoutMs, url, signal) {
   const endpoint = url || API_URL;
   if (!endpoint) throw new Error('API_URL غير مضبوط');
-  let lastErr;
-  for (let attempt = 0; attempt < 2; attempt++) {
+  const once = async (ms) => {
     const ctrl = new AbortController();
-    const t = setTimeout(() => ctrl.abort(), timeoutMs || 20000);
+    const onAbort = () => ctrl.abort();
+    if (signal) { if (signal.aborted) ctrl.abort(); else signal.addEventListener('abort', onAbort); }
+    const t = setTimeout(() => ctrl.abort(), ms);
     try {
       const res = await fetch(buildUrl(endpoint, params), { cache: 'no-store', redirect: 'follow', signal: ctrl.signal });
       const json = await readJson(res);
       if (json && json.success === false) throw new Error(json.error || 'خطأ من الخادم');
       return json;
-    } catch (e) {
-      lastErr = e;
-      if (attempt === 0) await new Promise(r => setTimeout(r, 300));
-    } finally { clearTimeout(t); }
+    } finally {
+      clearTimeout(t);
+      if (signal) signal.removeEventListener('abort', onAbort);
+    }
+  };
+  const ms = timeoutMs || 9000;
+  try { return await once(ms); }
+  catch (e) {
+    if (signal && signal.aborted) throw e;
+    if (e && e.name === 'AbortError') throw new Error('انتهت مهلة الاتصال');
+    return await once(ms);   // إعادة واحدة فقط لأخطاء الشبكة العابرة
   }
-  throw lastErr || new Error('تعذر الاتصال');
 }
 async function apiPost(action, payload, extra, url) {
   const endpoint = url || API_URL;
@@ -523,7 +551,7 @@ async function serverVersion() {
   try {
     const rs = await Promise.all(API_ENDPOINTS.map(async u => {
       try {
-        const res = await apiGet({ action: 'version' }, 8000, u);
+        const res = await apiGet({ action: 'version' }, 4000, u);
         return String((res && (res.version || (res.data && res.data.version))) || '');
       } catch (e) { return ''; }
     }));
@@ -614,34 +642,58 @@ function bundleOf(res) {
 }
 /* جلب الحزمة من خادم واحد مع سلسلة بدائل (خوادم قديمة أو أسماء إجراءات مختلفة) */
 async function fetchBundleFrom(url) {
-  const variants = [
+  const DEFAULTS = [
     { sheet: 'Orders', action: 'ordersBundle', slim: 1 },
     { sheet: 'Orders', action: 'ordersBundle' },
     { action: 'ordersBundle' },
     { sheet: 'Orders', action: 'getOrders' },
     { sheet: 'Orders' }
   ];
-  let lastErr = null, best = null;
-  for (const params of variants) {
+  const known = loadVariants()[url];
+
+  // 1) المسار السريع: الشكل الذي نجح آخر مرة — نداء واحد فقط
+  if (known) {
     try {
-      const res = await apiGet(params, 20000, url);
-      const b = bundleOf(res);
-      if (b) {
-        b.url = url;
-        if (b.orders && b.orders.length) return b;   // وجدنا طلبات فعلية
-        best = best || b;                            // استجابة صالحة لكن فارغة: نكمل المحاولة
-      } else {
-        lastErr = lastErr || new Error('استجابة غير متوقعة من الخادم');
-      }
-    } catch (e) { lastErr = lastErr || e; }
+      const b = bundleOf(await apiGet(known, 12000, url));
+      if (b) { b.url = url; return b; }
+    } catch (e) { /* نسقط إلى الاكتشاف المتوازي */ }
+    forgetVariant(url);
   }
-  if (best) return best;
-  throw lastErr || new Error('تعذر جلب البيانات');
+
+  // 2) الاكتشاف: كل البدائل بالتوازي، ونأخذ أول رد صالح ونلغي الباقي
+  const ctrl = new AbortController();
+  let lastErr = null, best = null, pending = DEFAULTS.length;
+  return await new Promise((resolve, reject) => {
+    const done = (b, params) => {
+      if (params) rememberVariant(url, params);
+      ctrl.abort();
+      resolve(b);
+    };
+    DEFAULTS.forEach(params => {
+      apiGet(params, 12000, url, ctrl.signal)
+        .then(res => {
+          const b = bundleOf(res);
+          if (b) {
+            b.url = url;
+            if (b.orders && b.orders.length) return done(b, params);
+            if (!best) best = { b: b, params: params };
+          } else if (!lastErr) lastErr = new Error('استجابة غير متوقعة من الخادم');
+        })
+        .catch(e => { if (!lastErr) lastErr = e; })
+        .finally(() => {
+          if (--pending === 0) {
+            if (best) return done(best.b, best.params);
+            ctrl.abort();
+            reject(lastErr || new Error('تعذر جلب البيانات'));
+          }
+        });
+    });
+  });
 }
 /* الإصلاح الجذري: نقرأ من كل روابط النشر المعروفة بالتوازي ثم ندمج النتائج،
    فلا تعود لوحة الإدارة تعرض 0 لمجرد أن الطلبات محفوظة على نشر آخر. */
 async function fetchBundle() {
-  if (inflightBundle) return inflightBundle;
+  if (inflightBundle) return inflightBundle;   // لا نداءين متوازيين لنفس البيانات
   inflightBundle = (async () => {
     const results = await Promise.allSettled(API_ENDPOINTS.map(u => fetchBundleFrom(u)));
     const ok = results.filter(r => r.status === 'fulfilled').map(r => r.value);
@@ -664,6 +716,7 @@ async function fetchBundle() {
         merged.orders.push(copy);
       });
     });
+    lastBundleAt = Date.now();
     return merged;
   })();
   try { return await inflightBundle; } finally { inflightBundle = null; }
@@ -781,9 +834,16 @@ function hydrateFromCache() {
 
 /* نبض الإصدار: أرخص بمئات المرات من تنزيل الحزمة */
 async function pollVersion() {
-  if (document.hidden) return;                 // لا نستهلك شيئًا واللوحة مخفية
+  if (document.hidden || !VERSION_SUPPORTED) return;   // لا نستهلك شيئًا بلا فائدة
+  if (inflightBundle) return;
   const v = await serverVersion();
-  if (!v) return;
+  if (!v) {
+    // الخادم لا يدعم action=version: نوقف النبض نهائيًا بدل إهدار نداءات كل 30 ثانية
+    VERSION_SUPPORTED = false;
+    clearInterval(autoTimer);
+    autoTimer = null;
+    return;
+  }
   if (DATA_VERSION && v === DATA_VERSION) return;   // لا جديد
   DATA_VERSION = v;
   try { await loadAll(); } catch (e) {}

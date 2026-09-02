@@ -406,11 +406,20 @@ async function withBusy(text, fn, btn) {
   try { return await fn(); } finally { busy(false); if (btn) btn.disabled = false; }
 }
 
-/* ===== الاتصال بالسيرفر =====
-   - GET وPOST يستخدمان رابط الطلبات نفسه فقط.
-   - يقرأ النص أولًا ثم يحوّله JSON حتى نلتقط أخطاء Apps Script (صفحة HTML).
-   - يمنع الكاش بإضافة طابع زمني.
-   - POST بنوع text/plain لتفادي طلب preflight الذي يرفضه Apps Script. */
+/* ===== الاتصال بالسيرفر — نسخة سريعة =====
+   الفكرة الذكية لحل البطء (ثلاث طبقات):
+   1) كاش محلي (localStorage): اللوحة تُرسم فورًا من آخر نسخة محفوظة (0ms)
+      ثم تُحدَّث بالخلفية — Stale While Revalidate.
+   2) نبض إصدار خفيف: نطلب action=version (بضع بايتات) بدل تنزيل كل البيانات،
+      ولا ننزّل الحزمة إلا إذا تغيّر رقم إصدار البيانات على الخادم.
+   3) نداء واحد موحّد (ordersBundle) يجلب الطلبات + المنتجات + الأقسام معًا،
+      بدل 3 نداءات متسلسلة مع سلاسل بدائل بطيئة.
+   ملاحظات: GET بدون preflight، وPOST بنوع text/plain كما كان. */
+const LS_KEY   = 'khotwa_admin_cache_v3';
+const PING_MS  = 12000;   // نبض الإصدار
+let DATA_VERSION = '';
+let inflightBundle = null;
+
 function buildUrl(base, params) {
   const u = new URL(base);
   Object.entries(params || {}).forEach(([k, v]) => {
@@ -424,19 +433,23 @@ async function readJson(res) {
   try { return JSON.parse(text); }
   catch (e) { throw new Error('رد غير صالح من الخادم (تحقق من صلاحية النشر: Anyone)'); }
 }
-async function apiGet(params) {
+/* GET مع مهلة قصوى ومحاولة إعادة واحدة (لا يعلّق الواجهة) */
+async function apiGet(params, timeoutMs) {
   if (!API_URL) throw new Error('API_URL غير مضبوط');
   let lastErr;
   for (let attempt = 0; attempt < 2; attempt++) {
+    const ctrl = new AbortController();
+    const t = setTimeout(() => ctrl.abort(), timeoutMs || 20000);
     try {
-      const res = await fetch(buildUrl(API_URL, params), { cache: 'no-store', redirect: 'follow' });
+      const res = await fetch(buildUrl(API_URL, params), { cache: 'no-store', redirect: 'follow', signal: ctrl.signal });
       const json = await readJson(res);
       if (json && json.success === false) throw new Error(json.error || 'خطأ من الخادم');
+      if (json && json.version) DATA_VERSION = String(json.version);
       return json;
     } catch (e) {
       lastErr = e;
-      if (attempt === 0) await new Promise(r => setTimeout(r, 400));
-    }
+      if (attempt === 0) await new Promise(r => setTimeout(r, 300));
+    } finally { clearTimeout(t); }
   }
   throw lastErr || new Error('تعذر الاتصال');
 }
@@ -450,6 +463,7 @@ async function apiPost(action, payload, extra) {
   });
   const json = await readJson(res);
   if (json && json.success === false) throw new Error(json.error || 'خطأ من الخادم');
+  if (json && json.version) DATA_VERSION = String(json.version);
   return json;
 }
 /* واجهة موحّدة متوافقة مع بقية الكود */
@@ -459,6 +473,37 @@ async function apiCall(action, payload, method) {
     : await apiGet(Object.assign({ action: action }, payload || {}));
   if (res && res.success === undefined) res.success = !(res && res.error);
   return res;
+}
+
+/* ===== الكاش المحلي ===== */
+function saveCache() {
+  const write = obj => localStorage.setItem(LS_KEY, JSON.stringify(obj));
+  const base = { v: DATA_VERSION, at: Date.now(), orders: orders, categories: categories };
+  try { write(Object.assign({ products: products }, base)); return; } catch (e) {}
+  // صور المنتجات قد تكون ضخمة (base64): نحفظ نسخة خفيفة بدون الصور
+  try {
+    const light = products.map(p => Object.assign({}, p, { image: '', img: '' }));
+    write(Object.assign({ products: light }, base));
+  } catch (e) {
+    try { write(Object.assign({ products: [] }, base)); } catch (e2) {}
+  }
+}
+function loadCache() {
+  try {
+    const raw = localStorage.getItem(LS_KEY);
+    if (!raw) return null;
+    const c = JSON.parse(raw);
+    if (!c || !Array.isArray(c.orders)) return null;
+    return c;
+  } catch (e) { return null; }
+}
+/* هل تغيّرت البيانات على الخادم؟ نداء بحجم بضع بايتات فقط */
+async function serverVersion() {
+  try {
+    const res = await apiGet({ action: 'version' }, 8000);
+    const v = (res && (res.version || (res.data && res.data.version))) || '';
+    return String(v || '');
+  } catch (e) { return ''; }
 }
 
 /* ===== الحالة ===== */
@@ -494,10 +539,15 @@ let autoTimer = null;
 function doLogin() {
   if ($('#pwd').value !== ADMIN_PASSWORD) { toast('كلمة المرور غير صحيحة'); return; }
   $('#loginOverlay').classList.add('hidden');
-  refreshAll();
-  // تحديث تلقائي كل 15 ثانية حتى تبقى لوحة الإدارة مطابقة لصفحة الطلبات
+  // 1) عرض فوري من الكاش المحلي  2) تحديث صامت بالخلفية
+  const hadCache = hydrateFromCache();
+  refreshAll(null, { silent: hadCache });
+  // نبض خفيف: لا ينزّل البيانات إلا عند تغيّرها فعلًا على الخادم
   clearInterval(autoTimer);
-  autoTimer = setInterval(() => { loadOrders().catch(() => {}); }, 15000);
+  autoTimer = setInterval(() => { pollVersion().catch(() => {}); }, PING_MS);
+  document.addEventListener('visibilitychange', () => {
+    if (!document.hidden) pollVersion().catch(() => {});
+  });
 }
 
 function switchTab(tab) {
@@ -507,8 +557,7 @@ function switchTab(tab) {
 }
 
 /* ===== التحميل =====
-   طبقة تحميل متسامحة: تجرّب أكثر من صيغة استعلام لكل مورد،
-   وتقبل أي شكل استجابة (مصفوفة مباشرة أو {data} أو {orders}). */
+   نداء واحد (ordersBundle) يعيد كل شيء، مع بدائل احتياطية عند الخوادم القديمة. */
 function pickArray(res, keys) {
   if (Array.isArray(res)) return res;
   if (!res || typeof res !== 'object') return null;
@@ -523,81 +572,55 @@ function pickArray(res, keys) {
   }
   return null;
 }
-async function fetchList(variants, keys) {
-  let firstErr = null;
-  for (const params of variants) {
-    try {
-      const res = await apiGet(params);
-      const arr = pickArray(res, keys);
-      if (arr && arr.length) return arr;
-      if (arr) firstErr = firstErr || null;
-    } catch (e) { firstErr = firstErr || e; }
-  }
-  if (firstErr) throw firstErr;
-  return [];
+function bundleOf(res) {
+  if (!res) return null;
+  if (Array.isArray(res)) return { orders: res, items: [] };
+  const b = (res.data && typeof res.data === 'object' && !Array.isArray(res.data)) ? res.data : res;
+  const src = Array.isArray(b.orders) ? b : (Array.isArray(res.orders) ? res : null);
+  if (!src) return null;
+  return {
+    orders: src.orders,
+    items: Array.isArray(src.items) ? src.items : [],
+    products: Array.isArray(src.products) ? src.products : (Array.isArray(res.products) ? res.products : null),
+    categories: Array.isArray(src.categories) ? src.categories : (Array.isArray(res.categories) ? res.categories : null)
+  };
 }
-
-async function loadCategories() {
-  categories = await fetchList([
-    { action: 'getCategories' },
-    { sheet: 'Categories' },
-    { action: 'list', sheet: 'Categories' }
-  ], ['data', 'categories', 'items']);
-  if (!categories.length && products.length) categories = deriveCategories();
-  renderCategories();
+/* نداء الحزمة الموحّد: واحد فقط، ومحمي من التكرار المتزامن */
+async function fetchBundle() {
+  if (inflightBundle) return inflightBundle;
+  inflightBundle = (async () => {
+    const variants = [
+      { sheet: 'Orders', action: 'ordersBundle', slim: 1 },
+      { sheet: 'Orders', action: 'ordersBundle' },
+      { action: 'ordersBundle' },
+      { sheet: 'Orders', action: 'getOrders' }
+    ];
+    let lastErr = null;
+    for (const params of variants) {
+      try {
+        const res = await apiGet(params);
+        const b = bundleOf(res);
+        if (b) return b;
+        lastErr = lastErr || new Error('استجابة غير متوقعة من الخادم');
+      } catch (e) { lastErr = lastErr || e; }
+    }
+    throw lastErr || new Error('تعذر جلب البيانات');
+  })();
+  try { return await inflightBundle; } finally { inflightBundle = null; }
 }
-async function loadProducts() {
-  products = await fetchList([
-    { action: 'getProducts' },
-    { sheet: 'Products' },
-    { action: 'list', sheet: 'Products' }
-  ], ['data', 'products', 'items']);
-  renderProducts();
+function applyBundle(b) {
+  if (b.products && b.products.length) products = b.products;
+  if (b.categories && b.categories.length) categories = b.categories;
+  orders = (b.orders || []).map(o => normalizeOrder(o, b.items || []));
+  if (!categories.length) categories = deriveCategories();
+  renderProducts(); renderCategories(); renderOrders();
+  saveCache();
 }
-/* لو كان تبويب الأقسام فارغًا في الشيت، نستنتج الأقسام من المنتجات/الطلبات */
-function deriveCategories() {
-  const seen = new Map();
-  products.forEach(p => {
-    const k = String(p.cat || p.category || '').trim();
-    if (k && !seen.has(k)) seen.set(k, { id: k, key: k, name: k });
-  });
-  orders.forEach(o => (o.items || []).forEach(i => {
-    const k = String(i.category || '').trim();
-    if (k && !seen.has(k)) seen.set(k, { id: k, key: k, name: k });
-  }));
-  return [...seen.values()];
-}
-
-/* تحميل الطلبات: نفس مصدر khotwa_orders.html حرفيًا (ordersBundle) مع سلسلة
-   بدائل احتياطية، وقبول أي شكل استجابة: {data:{orders}} أو {orders} أو مصفوفة مباشرة.
-   لم يعد فشل صيغة واحدة يُفرغ اللوحة ويُظهر "الطلبات (0)". */
-async function loadOrders() {
-  const variants = [
-    { sheet: 'Orders', action: 'ordersBundle' },
-    { action: 'ordersBundle' },
-    { sheet: 'Orders', action: 'getOrders' },
-    { sheet: 'Orders' }
-  ];
-  let lastErr = null, loaded = null;
-  for (const params of variants) {
-    try {
-      const res = await apiGet(params);
-      const bundle = (res && res.data && typeof res.data === 'object' && !Array.isArray(res.data))
-        ? res.data : res;
-      let list = null, items = [];
-      if (Array.isArray(res)) list = res;
-      else if (bundle && Array.isArray(bundle.orders)) { list = bundle.orders; items = Array.isArray(bundle.items) ? bundle.items : []; }
-      else if (res && Array.isArray(res.orders)) { list = res.orders; items = Array.isArray(res.items) ? res.items : []; }
-      else if (res && Array.isArray(res.data)) list = res.data;
-      if (!list) { lastErr = lastErr || new Error('استجابة غير متوقعة من الخادم'); continue; }
-      loaded = list.map(o => normalizeOrder(o, items));
-      if (loaded.length) break;      // نتيجة فعلية: نتوقف
-    } catch (e) { lastErr = lastErr || e; }
-  }
-  if (loaded === null) throw lastErr || new Error('تعذر جلب الطلبات');
-  orders = loaded;
-  renderOrders();
-}
+/* دوال متوافقة مع بقية الكود (الحفظ/الحذف) — كلها تمر عبر نداء واحد */
+async function loadAll() { applyBundle(await fetchBundle()); }
+async function loadOrders()     { return loadAll(); }
+async function loadProducts()   { return loadAll(); }
+async function loadCategories() { return loadAll(); }
 
 
 /* مفاتيح ربط الطلب بعناصره: أي تطابق بين معرفات الطلب ومعرفات العنصر */
@@ -655,22 +678,43 @@ function normalizeOrder(o, allItems) {
   };
 }
 
-async function refreshAll(btn) {
-  await withBusy('جاري تحميل البيانات…', async () => {
-    // المنتجات أولًا حتى تتوفر الأسعار عند تطبيع الطلبات
-    const base = await Promise.allSettled([loadProducts(), loadCategories()]);
-    const ord = await Promise.allSettled([loadOrders()]);
-    const results = base.concat(ord);
-    const failed = results.filter(r => r.status === 'rejected');
-    if (!categories.length) { categories = deriveCategories(); renderCategories(); }
-    if (failed.length === results.length) {
-      toast('تعذر الاتصال بالسيرفر: ' + ((failed[0].reason && failed[0].reason.message) || 'خطأ غير معروف'));
-    } else if (failed.length) {
-      toast('تم التحديث جزئيًا — بعض البيانات لم تُجلب');
-    } else {
-      toast('تم تحديث البيانات (' + orders.length + ' طلب)');
+/* تحديث ذكي:
+   - أول تحميل: نرسم من الكاش المحلي فورًا ثم نحدّث بالخلفية.
+   - التحديث الدوري: نسأل عن رقم الإصدار فقط، ولا ننزّل البيانات إلا عند تغيّره. */
+async function refreshAll(btn, opts) {
+  const silent = opts && opts.silent;
+  const run = async () => {
+    try {
+      await loadAll();
+      if (!silent) toast('تم تحديث البيانات (' + orders.length + ' طلب)');
+    } catch (e) {
+      if (!silent) toast('تعذر الاتصال بالسيرفر: ' + (e.message || 'خطأ غير معروف'));
     }
-  }, btn);
+  };
+  if (silent) return run();
+  return withBusy('جاري تحميل البيانات…', run, btn);
+}
+
+/* رسم فوري من الكاش المحلي قبل أي نداء شبكة */
+function hydrateFromCache() {
+  const c = loadCache();
+  if (!c) return false;
+  DATA_VERSION = c.v || '';
+  orders = c.orders || [];
+  products = c.products || [];
+  categories = c.categories || [];
+  renderProducts(); renderCategories(); renderOrders();
+  return true;
+}
+
+/* نبض الإصدار: أرخص بمئات المرات من تنزيل الحزمة */
+async function pollVersion() {
+  if (document.hidden) return;                 // لا نستهلك شيئًا واللوحة مخفية
+  const v = await serverVersion();
+  if (!v) return;
+  if (DATA_VERSION && v === DATA_VERSION) return;   // لا جديد
+  DATA_VERSION = v;
+  try { await loadAll(); } catch (e) {}
 }
 
 /* ============ الفترة الزمنية ============ */

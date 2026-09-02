@@ -375,12 +375,32 @@ tbody tr.clickable:hover{background:var(--sand)}
 
 <script>
 /* ============================================================
-   إعداد الاتصال — مصدر موحّد لكل البيانات.
-   هذا هو نفس CFG.url المستخدم في khotwa_orders.html حرفيًا.
-   لا تضف رابط نشر ثانٍ هنا، لأن ذلك قد يخلط بين ملفي بيانات مختلفين.
+   إعداد الاتصال — إصلاح جذري لمشكلة "0 طلب" في لوحة الإدارة.
+
+   السبب الجذري: كانت لوحة الإدارة تقرأ من رابط نشر (Deployment) مختلف عن
+   الرابط الذي تُكتب فيه الطلبات فعليًا من المتجر (khotwa.html) وتقرأها
+   صفحة الطلبات (khotwa_orders.html). رابطان مختلفان = ملفا بيانات مختلفان،
+   لذلك كانت الطلبات موجودة هناك ومعدومة هنا (0) مهما جرى تحديث الصفحة.
+
+   الحل: لوحة الإدارة الآن تقرأ من كل روابط النشر المعروفة وتدمج النتائج
+   (مع إزالة التكرار)، وتتذكّر مصدر كل طلب لتُرسل تحديث الحالة/الحذف
+   إلى نفس الخادم الذي جاء منه الطلب. حتى لو غُيّر رابط النشر مستقبلًا،
+   يكفي إضافته إلى المصفوفة أدناه.
    ============================================================ */
-const API_URL = 'https://script.google.com/macros/s/AKfycbxX8mZ5Hb5fyppH2zPD8vzHvcqvoZmObAWKG9oR9kw1U9ydE1KnVmRrCXweVyPFMwJ5Yw/exec';
+const API_ENDPOINTS = [
+  // خادم الطلبات (نفس CFG.url في khotwa_orders.html و API_URL في khotwa.html) — هنا تُكتب الطلبات
+  'https://script.google.com/macros/s/AKfycbyJ3KCf_Sqp4jvZYf9Nvp-CEf34aNXCpj2hs1_02pWjGpSX4pJBCJODSvJm7RQEfK3IbQ/exec',
+  // خادم الإدارة الموحّد (الأقسام والمنتجات)
+  'https://script.google.com/macros/s/AKfycbxX8mZ5Hb5fyppH2zPD8vzHvcqvoZmObAWKG9oR9kw1U9ydE1KnVmRrCXweVyPFMwJ5Yw/exec'
+].filter(Boolean);
+// الرابط الافتراضي للكتابة (الأقسام/المنتجات) = خادم الإدارة إن وُجد، وإلا الأول
+const API_URL = API_ENDPOINTS[API_ENDPOINTS.length - 1];
+// من أي خادم جاء كل طلب: id/number -> endpoint
+const ORDER_SOURCE = new Map();
+const sourceOf = o => (o && (ORDER_SOURCE.get(String(o.id)) || ORDER_SOURCE.get(String(o.number)))) || API_ENDPOINTS[0];
+
 const ADMIN_PASSWORD = 'khotwa2024';
+
 const BRAND = { name: 'خطوة', tag: 'نبني علامتك التجارية من الفكرة إلى السوق' };
 
 /* ===== أدوات ===== */
@@ -415,7 +435,7 @@ async function withBusy(text, fn, btn) {
    3) نداء واحد موحّد (ordersBundle) يجلب الطلبات + المنتجات + الأقسام معًا،
       بدل 3 نداءات متسلسلة مع سلاسل بدائل بطيئة.
    ملاحظات: GET بدون preflight، وPOST بنوع text/plain كما كان. */
-const LS_KEY   = 'khotwa_admin_cache_v3';
+const LS_KEY   = 'khotwa_admin_cache_v4';   // v4: إبطال أي كاش قديم فارغ (0 طلب)
 const PING_MS  = 12000;   // نبض الإصدار
 let DATA_VERSION = '';
 let inflightBundle = null;
@@ -433,18 +453,18 @@ async function readJson(res) {
   try { return JSON.parse(text); }
   catch (e) { throw new Error('رد غير صالح من الخادم (تحقق من صلاحية النشر: Anyone)'); }
 }
-/* GET مع مهلة قصوى ومحاولة إعادة واحدة (لا يعلّق الواجهة) */
-async function apiGet(params, timeoutMs) {
-  if (!API_URL) throw new Error('API_URL غير مضبوط');
+/* GET مع مهلة قصوى ومحاولة إعادة واحدة (لا يعلّق الواجهة) — يقبل تحديد الخادم */
+async function apiGet(params, timeoutMs, url) {
+  const endpoint = url || API_URL;
+  if (!endpoint) throw new Error('API_URL غير مضبوط');
   let lastErr;
   for (let attempt = 0; attempt < 2; attempt++) {
     const ctrl = new AbortController();
     const t = setTimeout(() => ctrl.abort(), timeoutMs || 20000);
     try {
-      const res = await fetch(buildUrl(API_URL, params), { cache: 'no-store', redirect: 'follow', signal: ctrl.signal });
+      const res = await fetch(buildUrl(endpoint, params), { cache: 'no-store', redirect: 'follow', signal: ctrl.signal });
       const json = await readJson(res);
       if (json && json.success === false) throw new Error(json.error || 'خطأ من الخادم');
-      if (json && json.version) DATA_VERSION = String(json.version);
       return json;
     } catch (e) {
       lastErr = e;
@@ -453,32 +473,33 @@ async function apiGet(params, timeoutMs) {
   }
   throw lastErr || new Error('تعذر الاتصال');
 }
-async function apiPost(action, payload, extra) {
-  if (!API_URL) throw new Error('API_URL غير مضبوط');
+async function apiPost(action, payload, extra, url) {
+  const endpoint = url || API_URL;
+  if (!endpoint) throw new Error('API_URL غير مضبوط');
   const body = JSON.stringify(Object.assign({ sheet: 'Orders', action: action, payload: payload || {} }, extra || {}));
-  const res = await fetch(API_URL, {
+  const res = await fetch(endpoint, {
     method: 'POST',
     headers: { 'Content-Type': 'text/plain;charset=utf-8' },
     body: body
   });
   const json = await readJson(res);
   if (json && json.success === false) throw new Error(json.error || 'خطأ من الخادم');
-  if (json && json.version) DATA_VERSION = String(json.version);
   return json;
 }
 /* واجهة موحّدة متوافقة مع بقية الكود */
-async function apiCall(action, payload, method) {
+async function apiCall(action, payload, method, url) {
   const res = (method && method.toUpperCase() === 'POST')
-    ? await apiPost(action, payload, payload && payload.id ? { id: payload.id } : null)
-    : await apiGet(Object.assign({ action: action }, payload || {}));
+    ? await apiPost(action, payload, payload && payload.id ? { id: payload.id } : null, url)
+    : await apiGet(Object.assign({ action: action }, payload || {}), undefined, url);
   if (res && res.success === undefined) res.success = !(res && res.error);
   return res;
 }
 
+
 /* ===== الكاش المحلي ===== */
 function saveCache() {
   const write = obj => localStorage.setItem(LS_KEY, JSON.stringify(obj));
-  const base = { v: DATA_VERSION, at: Date.now(), orders: orders, categories: categories };
+  const base = { v: DATA_VERSION, at: Date.now(), orders: orders, categories: categories, src: Array.from(ORDER_SOURCE.entries()) };
   try { write(Object.assign({ products: products }, base)); return; } catch (e) {}
   // صور المنتجات قد تكون ضخمة (base64): نحفظ نسخة خفيفة بدون الصور
   try {
@@ -497,14 +518,20 @@ function loadCache() {
     return c;
   } catch (e) { return null; }
 }
-/* هل تغيّرت البيانات على الخادم؟ نداء بحجم بضع بايتات فقط */
+/* هل تغيّرت البيانات على أي خادم؟ نجمع إصدارات كل الخوادم في بصمة واحدة */
 async function serverVersion() {
   try {
-    const res = await apiGet({ action: 'version' }, 8000);
-    const v = (res && (res.version || (res.data && res.data.version))) || '';
-    return String(v || '');
+    const rs = await Promise.all(API_ENDPOINTS.map(async u => {
+      try {
+        const res = await apiGet({ action: 'version' }, 8000, u);
+        return String((res && (res.version || (res.data && res.data.version))) || '');
+      } catch (e) { return ''; }
+    }));
+    const v = rs.join('|');
+    return /[^|]/.test(v) ? v : '';
   } catch (e) { return ''; }
 }
+
 
 /* ===== الحالة ===== */
 let categories = [], products = [], orders = [], currentOrder = null;
@@ -585,37 +612,79 @@ function bundleOf(res) {
     categories: Array.isArray(src.categories) ? src.categories : (Array.isArray(res.categories) ? res.categories : null)
   };
 }
-/* نداء الحزمة الموحّد: واحد فقط، ومحمي من التكرار المتزامن */
+/* جلب الحزمة من خادم واحد مع سلسلة بدائل (خوادم قديمة أو أسماء إجراءات مختلفة) */
+async function fetchBundleFrom(url) {
+  const variants = [
+    { sheet: 'Orders', action: 'ordersBundle', slim: 1 },
+    { sheet: 'Orders', action: 'ordersBundle' },
+    { action: 'ordersBundle' },
+    { sheet: 'Orders', action: 'getOrders' },
+    { sheet: 'Orders' }
+  ];
+  let lastErr = null, best = null;
+  for (const params of variants) {
+    try {
+      const res = await apiGet(params, 20000, url);
+      const b = bundleOf(res);
+      if (b) {
+        b.url = url;
+        if (b.orders && b.orders.length) return b;   // وجدنا طلبات فعلية
+        best = best || b;                            // استجابة صالحة لكن فارغة: نكمل المحاولة
+      } else {
+        lastErr = lastErr || new Error('استجابة غير متوقعة من الخادم');
+      }
+    } catch (e) { lastErr = lastErr || e; }
+  }
+  if (best) return best;
+  throw lastErr || new Error('تعذر جلب البيانات');
+}
+/* الإصلاح الجذري: نقرأ من كل روابط النشر المعروفة بالتوازي ثم ندمج النتائج،
+   فلا تعود لوحة الإدارة تعرض 0 لمجرد أن الطلبات محفوظة على نشر آخر. */
 async function fetchBundle() {
   if (inflightBundle) return inflightBundle;
   inflightBundle = (async () => {
-    const variants = [
-      { sheet: 'Orders', action: 'ordersBundle', slim: 1 },
-      { sheet: 'Orders', action: 'ordersBundle' },
-      { action: 'ordersBundle' },
-      { sheet: 'Orders', action: 'getOrders' }
-    ];
-    let lastErr = null;
-    for (const params of variants) {
-      try {
-        const res = await apiGet(params);
-        const b = bundleOf(res);
-        if (b) return b;
-        lastErr = lastErr || new Error('استجابة غير متوقعة من الخادم');
-      } catch (e) { lastErr = lastErr || e; }
+    const results = await Promise.allSettled(API_ENDPOINTS.map(u => fetchBundleFrom(u)));
+    const ok = results.filter(r => r.status === 'fulfilled').map(r => r.value);
+    if (!ok.length) {
+      const err = results.find(r => r.status === 'rejected');
+      throw (err && err.reason) || new Error('تعذر جلب البيانات');
     }
-    throw lastErr || new Error('تعذر جلب البيانات');
+    const merged = { orders: [], items: [], products: [], categories: [] };
+    const seen = new Set();
+    ok.forEach(b => {
+      (b.items || []).forEach(i => merged.items.push(i));
+      (b.products || []).forEach(p => { if (!merged.products.some(x => String(x.id) === String(p.id))) merged.products.push(p); });
+      (b.categories || []).forEach(c => { if (!merged.categories.some(x => String(x.id || x.key || x.name) === String(c.id || c.key || c.name))) merged.categories.push(c); });
+      (b.orders || []).forEach(o => {
+        const key = String(o.order_number || o.orderNumber || o.number || o.id || o.order_id || JSON.stringify(o));
+        if (seen.has(key)) return;
+        seen.add(key);
+        const copy = Object.assign({}, o);
+        copy.__src = b.url;                 // نتذكّر مصدر الطلب لتحديث الحالة/الحذف لاحقًا
+        merged.orders.push(copy);
+      });
+    });
+    return merged;
   })();
   try { return await inflightBundle; } finally { inflightBundle = null; }
 }
 function applyBundle(b) {
   if (b.products && b.products.length) products = b.products;
   if (b.categories && b.categories.length) categories = b.categories;
-  orders = (b.orders || []).map(o => normalizeOrder(o, b.items || []));
+  ORDER_SOURCE.clear();
+  orders = (b.orders || []).map(o => {
+    const n = normalizeOrder(o, b.items || []);
+    if (o.__src) {
+      if (n.id) ORDER_SOURCE.set(String(n.id), o.__src);
+      if (n.number) ORDER_SOURCE.set(String(n.number), o.__src);
+    }
+    return n;
+  });
   if (!categories.length) categories = deriveCategories();
   renderProducts(); renderCategories(); renderOrders();
   saveCache();
 }
+
 /* دوال متوافقة مع بقية الكود (الحفظ/الحذف) — كلها تمر عبر نداء واحد */
 async function loadAll() { applyBundle(await fetchBundle()); }
 async function loadOrders()     { return loadAll(); }
@@ -703,6 +772,9 @@ function hydrateFromCache() {
   orders = c.orders || [];
   products = c.products || [];
   categories = c.categories || [];
+  ORDER_SOURCE.clear();
+  (Array.isArray(c.src) ? c.src : []).forEach(([k, v]) => ORDER_SOURCE.set(String(k), v));
+
   renderProducts(); renderCategories(); renderOrders();
   return true;
 }
@@ -842,11 +914,14 @@ async function changeStatus(value, el) {
   if (!currentOrder) return;
   await withBusy('جاري تحديث الحالة…', async () => {
     try {
+      // نرسل التحديث إلى الخادم الذي جاء منه الطلب فعلًا (وليس دائمًا خادم الإدارة)
       const res = await apiCall('update', {
         id: currentOrder.id || currentOrder.number,
+        number: currentOrder.number,
         status: SERVER_STATUS[value] || value,
         updatedAt: new Date().toISOString()
-      }, 'POST');
+      }, 'POST', sourceOf(currentOrder));
+
       if (res.success) { currentOrder.status = mapStatus(value); renderOrders(); toast('تم تحديث الحالة'); }
       else toast('فشل التحديث: ' + (res.error || ''));
     } catch (e) { toast('خطأ في الاتصال بالسيرفر'); }

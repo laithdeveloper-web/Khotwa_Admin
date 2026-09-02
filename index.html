@@ -337,14 +337,13 @@ tbody tr.clickable:hover{background:var(--sand)}
         <div class="stat"><span>قيد التنفيذ</span><b id="stPrep">0</b></div>
         <div class="stat"><span>مكتملة</span><b id="stDone">0</b></div>
         <div class="stat"><span>عدد الخدمات المطلوبة</span><b id="stPieces">0</b></div>
-        <div class="stat"><span>إجمالي القيمة</span><b id="stTotal">0.00</b></div>
       </div>
 
       <div class="table-wrap">
         <table>
           <thead><tr>
             <th>رقم الطلب</th><th>التاريخ</th><th>العميل</th><th>الهاتف</th>
-            <th>البراند</th><th>المجال</th><th>البنود</th><th>الإجمالي</th><th>الحالة</th><th>طباعة</th>
+            <th>البراند</th><th>المجال</th><th>البنود</th><th>الحالة</th><th>طباعة</th>
           </tr></thead>
           <tbody id="ordTableBody"></tbody>
         </table>
@@ -759,13 +758,6 @@ function parseMaybeJson(v) {
   if (typeof v === 'string' && v.trim().startsWith('[')) { try { return JSON.parse(v); } catch (e) { return []; } }
   return [];
 }
-/* سعر المنتج من تبويب المنتجات عند غياب السعر في سطر الطلب */
-function productPrice(i) {
-  const pid = String(i.product_id || i.productId || '').trim();
-  const nm = String(i.product_name || i.productName || i.name || '').trim();
-  const hit = products.find(p => (pid && String(p.id) === pid) || (nm && String(p.name) === nm));
-  return hit ? Number(hit.price) || 0 : 0;
-}
 function normalizeOrder(o, allItems) {
   const keys = orderKeys(o);
   const id = keys[0] || '';
@@ -775,12 +767,8 @@ function normalizeOrder(o, allItems) {
   const items = raw.map(i => ({
     name: i.product_name || i.productName || i.name || i.product_id || i.title || '—',
     category: i.category || i.cat || '',
-    qty: Number(i.quantity != null ? i.quantity : i.qty) || 1,
-    price: Number(i.price != null && i.price !== '' ? i.price : i.unit_price) || productPrice(i),
     options: i.options || i.note || ''
   }));
-  const total = Number(o.total || o.grand_total || o.amount || o.subtotal) ||
-    items.reduce((s, i) => s + i.price * i.qty, 0);
   return {
     id, number,
     at: o.created_at || o.createdAt || o.at || o.date || o.timestamp || '',
@@ -795,8 +783,7 @@ function normalizeOrder(o, allItems) {
     note: o.notes || o.note || '',
     source: o.source || 'khotwa',
     items,
-    itemsCount: Number(o.itemsCount || o.items_count) || items.reduce((n, i) => n + i.qty, 0),
-    total
+    itemsCount: items.length
   };
 }
 
@@ -916,7 +903,6 @@ function renderOrders() {
   $('#stPrep').textContent = list.filter(o => o.status === 'prep').length;
   $('#stDone').textContent = list.filter(o => o.status === 'done').length;
   $('#stPieces').textContent = ok.reduce((n, o) => n + o.itemsCount, 0);
-  $('#stTotal').textContent = fmt(ok.reduce((s, o) => s + o.total, 0));
 
   const tbody = $('#ordTableBody'), empty = $('#ordEmpty');
   if (!list.length) { tbody.innerHTML = ''; empty.hidden = false; return; }
@@ -932,7 +918,6 @@ function renderOrders() {
       <td>${esc(o.customer.brand || '—')}</td>
       <td class="muted">${esc(o.customer.field || '—')}</td>
       <td class="num">${o.itemsCount}</td>
-      <td class="num">${fmt(o.total)}</td>
       <td><span class="pill ${s.c}">${s.t}</span></td>
       <td><button class="btn btn-sm btn-ghost" onclick="event.stopPropagation();printInvoice('${esc(num)}')">🖨️</button></td>
     </tr>`;
@@ -958,9 +943,8 @@ function openOrderPanel(number) {
     ${o.note ? `<div class="kv"><span>ملاحظات</span><strong style="font-weight:400">${esc(o.note)}</strong></div>` : ''}
     <div>
       <div class="kv" style="margin-bottom:8px;border:0;padding:0"><span>الخدمات المطلوبة</span></div>
-      <div class="lines">${o.items.map(i => `<div class="line"><span>${esc(i.name)} × ${i.qty}</span><b class="num">${fmt(i.price * i.qty)}</b></div>`).join('') || '<div class="line">—</div>'}</div>
-    </div>
-    <div class="kv" style="border:0"><div class="rowsum"><span>الإجمالي</span><span class="num">${fmt(o.total)}</span></div></div>`;
+      <div class="lines">${o.items.map(i => `<div class="line"><span>${esc(i.name)}</span>${i.category ? `<span class="muted">${esc(i.category)}</span>` : ''}</div>`).join('') || '<div class="line">—</div>'}</div>
+    </div>`;
   $('#ordWhats').href = 'https://wa.me/' + String(c.phone).replace(/[^\d]/g, '');
   $('#ordPanel').classList.add('open');
   $('#ordOverlay').classList.add('open');
@@ -992,8 +976,8 @@ async function changeStatus(value, el) {
 function invoiceHTML(o) {
   const c = o.customer;
   const rows = (o.items || []).map(i =>
-    `<tr><td>${esc(i.name)}</td><td>${esc(i.category || '—')}</td><td>${i.qty}</td><td>${fmt(i.price)}</td><td>${fmt(i.price * i.qty)}</td></tr>`
-  ).join('') || `<tr><td colspan="5" style="text-align:center;color:#7a8b92">لا توجد بنود</td></tr>`;
+    `<tr><td>${esc(i.name)}</td><td>${esc(i.category || '—')}</td><td>${esc(i.options || '—')}</td></tr>`
+  ).join('') || `<tr><td colspan="3" style="text-align:center;color:#7a8b92">لا توجد بنود</td></tr>`;
   return `
   <div class="inv-page">
     <div class="inv-head">
@@ -1021,10 +1005,9 @@ function invoiceHTML(o) {
     </div>
     <div class="inv-sect-title">الخدمات المطلوبة</div>
     <table class="inv-table">
-      <thead><tr><th>الخدمة</th><th>القسم</th><th>الكمية</th><th>السعر</th><th>الإجمالي</th></tr></thead>
+      <thead><tr><th>الخدمة</th><th>القسم</th><th>تفاصيل</th></tr></thead>
       <tbody>${rows}</tbody>
     </table>
-    <div class="inv-totals"><div class="row"><span>الإجمالي الكلي</span><span>${fmt(o.total)}</span></div></div>
     ${o.note ? `<div class="inv-note"><b>ملاحظات العميل:</b> ${esc(o.note)}</div>` : ''}
     <div class="inv-footer">
       <div>شكرًا لثقتكم بـ${BRAND.name} — خطوتك الأولى نحو علامة تجارية ناجحة.</div>
@@ -1037,11 +1020,10 @@ function coverPage(list) {
   const rows = list.map(o => `<tr>
     <td>#${esc(o.number)}</td><td>${dt(o.at)}</td><td>${esc(o.customer.name)}</td>
     <td>${esc(o.customer.brand || '—')}</td><td>${o.itemsCount}</td>
-    <td>${stOf(o.status).t}</td><td>${fmt(o.total)}</td></tr>`).join('');
+    <td>${stOf(o.status).t}</td></tr>`).join('');
   const ok = list.filter(o => o.status !== 'cancel');
   const cards = [
     ['عدد الطلبات', list.length],
-    ['إجمالي القيمة', fmt(ok.reduce((s, o) => s + o.total, 0))],
     ['عدد البنود', ok.reduce((n, o) => n + o.itemsCount, 0)],
     ['طلبات ملغاة', list.length - ok.length]
   ];
@@ -1054,7 +1036,7 @@ function coverPage(list) {
     </div>
     <div class="rep-cards">${cards.map(c => `<div><span>${c[0]}</span><b>${c[1]}</b></div>`).join('')}</div>
     <table class="inv-table">
-      <thead><tr><th>رقم الطلب</th><th>التاريخ</th><th>العميل</th><th>البراند</th><th>البنود</th><th>الحالة</th><th>الإجمالي</th></tr></thead>
+      <thead><tr><th>رقم الطلب</th><th>التاريخ</th><th>العميل</th><th>البراند</th><th>البنود</th><th>الحالة</th></tr></thead>
       <tbody>${rows}</tbody>
     </table>
     <div class="inv-footer"><div>تفاصيل كل طلب في صفحة منفصلة بعد هذه الصفحة.</div><div>تاريخ الطباعة: ${dt(new Date())}</div></div>
@@ -1080,12 +1062,12 @@ function printAllOrders() {
 function exportOrdersCSV() {
   const list = ordersView();
   if (!list.length) { toast('لا توجد بيانات للتصدير'); return; }
-  const rows = [['رقم الطلب','التاريخ','العميل','الهاتف','البريد','البراند','المجال','الخدمات','عدد البنود','الإجمالي','الحالة','ملاحظات']];
+  const rows = [['رقم الطلب','التاريخ','العميل','الهاتف','البريد','البراند','المجال','الخدمات','عدد البنود','الحالة','ملاحظات']];
   list.forEach(o => rows.push([
     o.number, dt(o.at), o.customer.name, o.customer.phone, o.customer.email,
     o.customer.brand, o.customer.field,
-    o.items.map(i => `${i.name}×${i.qty}`).join(' | '),
-    o.itemsCount, fmt(o.total), stOf(o.status).t, o.note
+    o.items.map(i => i.name).join(' | '),
+    o.itemsCount, stOf(o.status).t, o.note
   ]));
   const csv = '\uFEFF' + rows.map(r => r.map(v => `"${String(v == null ? '' : v).replace(/"/g, '""')}"`).join(',')).join('\n');
   const a = document.createElement('a');
